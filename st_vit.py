@@ -94,8 +94,7 @@ class SpatioTemporalTransformer(nn.Module):
             
         return x
 
-#  Spatio- & Temporal Vision Transformer
-class STVit(nn.Module):
+class SVit(nn.Module):
     def __init__(self, *, dim, depth, heads, mlp_dim, dim_head = 64, dropout = 0., emb_dropout = 0.):
         super().__init__()
         self.dropout = nn.Dropout(emb_dropout)
@@ -107,7 +106,6 @@ class STVit(nn.Module):
         x = self.transformer(x)
         return self.mlp(x)
 
-# Spatio- & Temporal Auto-regressive Vision Transformer
 class STAViT(nn.Module):
     def __init__(self,
                  channels=1, 
@@ -115,7 +113,7 @@ class STAViT(nn.Module):
                  dim=256, 
                  heads=8, 
                  depth=3,
-                 dim_head=128,
+                 dim_head=64,
                  mlp_dim=256
                  ):
         super().__init__()
@@ -127,7 +125,7 @@ class STAViT(nn.Module):
             nn.Linear(pixel_values_per_patch, dim),
         )
         
-        self.spatio_temporal_transformer = STVit(
+        self.spatio_temporal_transformer = SVit(
             dim = dim,
             depth = depth,
             heads = heads,
