@@ -69,15 +69,14 @@ class SpatioTemporalTransformer(nn.Module):
         
         pos = RotaryEmbedding(dim = dim_head)
         
-        self.alpha = nn.Parameter(torch.randn(dim))
-        self.norm_out = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm(dim)
         
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 PreNorm(dim, Attention(pos, dim, heads = heads, dim_head = dim_head, dropout = dropout)),
                 PreNorm(dim, Attention(pos, dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout)),
+                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
             ]))
              
     def forward(self, x):
@@ -85,14 +84,15 @@ class SpatioTemporalTransformer(nn.Module):
         for attn_s, attn_t, ff in self.layers:
             
             x_s = rearrange(x, 'b t p d -> (b t) p d')
-            x_p = rearrange(x, 'b t p d -> (b p) t d')    
+            x_s = rearrange(attn_s(x_s), '(b t) p d -> b t p d', b=b)
             
-            x_hat = rearrange(attn_s(x_s), '(b t) p d -> b t p d', b=b) * torch.sigmoid(self.alpha)\
-                + rearrange(attn_t(x_p), '(b p) t d -> b t p d', b=b) * (1 - torch.sigmoid(self.alpha))
+            x_t = rearrange(x + x_s, 'b t p d -> (b p) t d')    
+            x_t = rearrange(attn_t(x_t), '(b p) t d -> b t p d', b=b)
             
-            x = ff(self.norm_out(x_hat)) + x_hat
+            x = x_s + x_t
+            x = ff(x) + x
             
-        return x
+        return self.norm(x)
 
 class SVit(nn.Module):
     def __init__(self, *, dim, depth, heads, mlp_dim, dim_head = 64, dropout = 0., emb_dropout = 0.):
@@ -111,10 +111,10 @@ class STAViT(nn.Module):
                  channels=1, 
                  patch_size=64,
                  dim=256, 
-                 heads=8, 
-                 depth=3,
+                 heads=4,
+                 depth=2,
                  dim_head=64,
-                 mlp_dim=256
+                 mlp_dim=128
                  ):
         super().__init__()
         
@@ -135,7 +135,11 @@ class STAViT(nn.Module):
             emb_dropout = 0.1
         )
         
-        self.to_pixels = nn.Linear(dim, pixel_values_per_patch)
+        self.to_pixels = nn.Sequential(
+                nn.Linear(dim, dim * 4, bias = False),
+                nn.Tanh(),
+                nn.Linear(dim * 4, pixel_values_per_patch, bias = False),
+            )
         
     def to_patches(self, x):
         return self.to_patch_embedding(x)
