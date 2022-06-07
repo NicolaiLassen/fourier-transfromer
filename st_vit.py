@@ -1,9 +1,22 @@
 import torch.nn as nn
 import torch
 
+from functools import wraps
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
+
+# helpers
+
+def _many(fn):
+    @wraps(fn)
+    def inner(tensors, pattern, **kwargs):
+        return (fn(tensor, pattern, **kwargs) for tensor in tensors)
+    return inner
+
+rearrange_many = _many(rearrange)
+
+# classes
 
 class PreNorm(nn.Module):
     def __init__(self, dim, fn):
@@ -48,8 +61,8 @@ class Attention(nn.Module):
         ) if project_out else nn.Identity()
 
     def forward(self, x):
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = rearrange_many((q, k, v), 'b n (h d) -> b h n d', h = self.heads)
 
         q = self.pos.rotate_queries_or_keys(q)
         k = self.pos.rotate_queries_or_keys(k)
@@ -64,9 +77,10 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 class SpatioTemporalTransformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+    def __init__(self, dim, depth, heads, dim_head, dropout = 0.):
         super().__init__()
         
+        # https://arxiv.org/abs/2104.09864
         pos = RotaryEmbedding(dim = dim_head)
         
         self.norm = nn.LayerNorm(dim)
@@ -76,12 +90,14 @@ class SpatioTemporalTransformer(nn.Module):
             self.layers.append(nn.ModuleList([
                 PreNorm(dim, Attention(pos, dim, heads = heads, dim_head = dim_head, dropout = dropout)),
                 PreNorm(dim, Attention(pos, dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
+                nn.LayerNorm(dim)
             ]))
              
     def forward(self, x):
         b = x.shape[0]
-        for attn_s, attn_t, ff in self.layers:
+       
+        # https://arxiv.org/abs/2205.15868
+        for attn_s, attn_t, norm in self.layers:
             
             x_s = rearrange(x, 'b t p d -> (b t) p d')
             x_s = rearrange(attn_s(x_s), '(b t) p d -> b t p d', b=b)
@@ -89,16 +105,16 @@ class SpatioTemporalTransformer(nn.Module):
             x_t = rearrange(x + x_s, 'b t p d -> (b p) t d')    
             x_t = rearrange(attn_t(x_t), '(b p) t d -> b t p d', b=b)
             
-            x = x_s + x_t
-            x = ff(x) + x
+            x = norm(x_s + x_t) + x
             
         return self.norm(x)
 
-class SVit(nn.Module):
-    def __init__(self, *, dim, depth, heads, mlp_dim, dim_head = 64, dropout = 0., emb_dropout = 0.):
+# https://arxiv.org/abs/2010.11929
+class TVit(nn.Module):
+    def __init__(self, *, dim, depth, heads, dim_head = 64, dropout = 0., emb_dropout = 0.):
         super().__init__()
         self.dropout = nn.Dropout(emb_dropout)
-        self.transformer = SpatioTemporalTransformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+        self.transformer = SpatioTemporalTransformer(dim, depth, heads, dim_head, dropout)
         self.mlp = nn.Linear(dim, dim)
         
     def forward(self, x):
@@ -106,6 +122,7 @@ class SVit(nn.Module):
         x = self.transformer(x)
         return self.mlp(x)
 
+# https://arxiv.org/abs/2010.11929
 class STAViT(nn.Module):
     def __init__(self,
                  channels=1, 
@@ -113,8 +130,7 @@ class STAViT(nn.Module):
                  dim=256, 
                  heads=4,
                  depth=2,
-                 dim_head=64,
-                 mlp_dim=128
+                 dim_head=64
                  ):
         super().__init__()
         
@@ -125,22 +141,17 @@ class STAViT(nn.Module):
             nn.Linear(pixel_values_per_patch, dim),
         )
         
-        self.spatio_temporal_transformer = SVit(
+        self.spatio_temporal_transformer = TVit(
             dim = dim,
             depth = depth,
             heads = heads,
-            mlp_dim = mlp_dim,
             dim_head=dim_head,
             dropout = 0.1,
             emb_dropout = 0.1
         )
         
-        self.to_pixels = nn.Sequential(
-                nn.Linear(dim, dim * 4, bias = False),
-                nn.Tanh(),
-                nn.Linear(dim * 4, pixel_values_per_patch, bias = False),
-            )
-        
+        self.to_pixels = nn.Linear(dim, pixel_values_per_patch, bias = False)
+            
     def to_patches(self, x):
         return self.to_patch_embedding(x)
 
