@@ -77,7 +77,7 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 class SpatioTemporalTransformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, dropout = 0.):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
         super().__init__()
         
         # https://arxiv.org/abs/2104.09864
@@ -88,14 +88,14 @@ class SpatioTemporalTransformer(nn.Module):
             self.layers.append(nn.ModuleList([
                 PreNorm(dim, Attention(pos, dim, heads = heads, dim_head = dim_head, dropout = dropout)),
                 PreNorm(dim, Attention(pos, dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                nn.LayerNorm(dim)
+                PreNorm(dim, FeedForward(dim, mlp_dim))
             ]))
              
     def forward(self, x):
         b = x.shape[0]
-       
+        
         # https://arxiv.org/abs/2205.15868
-        for attn_s, attn_t, norm in self.layers:
+        for attn_s, attn_t, ff in self.layers:
             
             x_s = rearrange(x, 'b t p d -> (b t) p d')
             x_s = rearrange(attn_s(x_s), '(b t) p d -> b t p d', b=b)
@@ -103,33 +103,21 @@ class SpatioTemporalTransformer(nn.Module):
             x_t = rearrange(x + x_s, 'b t p d -> (b p) t d')    
             x_t = rearrange(attn_t(x_t), '(b p) t d -> b t p d', b=b)
             
-            x = norm(x_s + x_t) + x
+            x = ff(x_t + x_s) + x
             
         return x
-
-# https://arxiv.org/abs/2010.11929
-class TVit(nn.Module):
-    def __init__(self, *, dim, depth, heads, dim_head = 64, dropout = 0., emb_dropout = 0.):
-        super().__init__()
-        self.dropout = nn.Dropout(emb_dropout)
-        self.transformer = SpatioTemporalTransformer(dim, depth, heads, dim_head, dropout)
-        self.mlp = nn.Linear(dim, dim, bias=False)
-        
-    def forward(self, x):
-        x = self.dropout(x)
-        x = self.transformer(x)
-        return self.mlp(x)
 
 # https://arxiv.org/abs/2010.11929
 class TAViT(nn.Module):
     def __init__(self,
                  max_seq_len=15,
                  channels=1, 
-                 patch_size=16,
-                 dim=256, 
-                 heads=8,
+                 patch_size=32,
+                 dim=256,
+                 heads=6,
                  depth=3,
-                 dim_head=64
+                 dim_head=64,
+                 mlp_dim=128
                  ):
         super().__init__()
         
@@ -142,35 +130,28 @@ class TAViT(nn.Module):
             nn.Linear(pixel_values_per_patch, dim),
         )
         
-        self.spatio_temporal_transformer = TVit(
-            dim = dim,
-            depth = depth,
-            heads = heads,
-            dim_head=dim_head,
-            dropout = 0.1,
-            emb_dropout = 0.1
-        )
+        self.encoder = SpatioTemporalTransformer(dim, depth, heads, dim_head, mlp_dim, 0.01)
+        
+        self.decoder = SpatioTemporalTransformer(dim, depth, heads, dim_head, mlp_dim, 0.01)
         
         self.to_pixels = nn.Linear(dim, pixel_values_per_patch)
             
     def generate(self, start_tokens, seq_len):
         _, t, _, h, w = start_tokens.shape
                 
-        out = self.to_patch_embedding(start_tokens)
+        out = self.encoder(self.to_patch_embedding(start_tokens))
         
         for _ in range(seq_len):
             x = out[:, -self.max_seq_len:]
+            x = self.encoder(x)
             
-            last = self.next_latent(x)[:, -1:]
+            last = self.decoder(x)[:, -1:]
             out = torch.cat((out, last), dim = 1)
         
         out = out[:, t:]
         
         return model.recover(out, h, w)
 
-    def next_latent(self, x):
-        return self.spatio_temporal_transformer(x)
-        
     def recover(self, x, h, w):
         p = self.to_pixels(x)
         p = rearrange(p, 'b t p d -> b t (p d)')
@@ -179,10 +160,13 @@ class TAViT(nn.Module):
         
     def forward(self, x):        
         h, w = x.shape[3:5]
+        
         x = self.to_patch_embedding(x)
-        x_h = self.next_latent(x)
         
-        x_h_t_p = self.recover(x_h,h,w)
-        x_p = self.recover(x,h,w)
+        x_e = self.encoder(x)
+        x_p = self.recover(x_e, h, w)
         
-        return x, x_h, x_p, x_h_t_p
+        x_h = self.decoder(x_e)
+        x_h_p = self.recover(x_h, h, w)
+        
+        return x_e, x_h, x_p, x_h_p
