@@ -132,7 +132,10 @@ class TAViT(nn.Module):
         
         self.encoder = SpatioTemporalTransformer(dim, depth, heads, dim_head, mlp_dim, 0.01)
         
-        self.decoder = SpatioTemporalTransformer(dim, depth, heads, dim_head, mlp_dim, 0.01)
+        self.decoder = nn.Sequential(
+            SpatioTemporalTransformer(dim, depth, heads, dim_head, mlp_dim, 0.01),
+            nn.Linear(dim, dim, bias=False)
+        )
         
         self.to_pixels = nn.Linear(dim, pixel_values_per_patch)
             
@@ -143,14 +146,11 @@ class TAViT(nn.Module):
         
         for _ in range(seq_len):
             x = out[:, -self.max_seq_len:]
-            x = self.encoder(x)
             
             last = self.decoder(x)[:, -1:]
             out = torch.cat((out, last), dim = 1)
         
-        out = out[:, t:]
-        
-        return model.recover(out, h, w)
+        return self.recover(out, h, w)
 
     def recover(self, x, h, w):
         p = self.to_pixels(x)
