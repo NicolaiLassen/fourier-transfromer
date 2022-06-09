@@ -1,1 +1,1 @@
-# Temporal Vision Transformer (TViT)
+# Temporal Autoregressive Vision Transformer (TAViT)
