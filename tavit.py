@@ -1,172 +1,61 @@
-import torch.nn as nn
-import torch
+from libs import *
+from libs.ns_lite import *
+get_seed(1127802)
+import numpy as np
 
-from functools import wraps
-from einops import rearrange
-from einops.layers.torch import Rearrange
-from rotary_embedding_torch import RotaryEmbedding
+batch_size = 4
 
-# helpers
+config = defaultdict(lambda: None,
+                     node_feats=10+2,
+                     pos_dim=2,
+                     n_targets=1,
+                     n_hidden=48, 
+                     num_feat_layers=0,
+                     num_encoder_layers=4,
+                     n_head=1,
+                     dim_feedforward=96,
+                     attention_type='galerkin',
+                     feat_extract_type=None,
+                     xavier_init=0.01,
+                     diagonal_weight=0.01,
+                     layer_norm=True,
+                     attn_norm=False,
+                     return_attn_weight=False,
+                     return_latent=False,
+                     decoder_type='ifft',
+                     freq_dim=20,
+                     num_regressor_layers=2,
+                     fourier_modes=12,
+                     spacial_dim=2,
+                     spacial_fc=False,
+                     dropout=0.0,
+                     encoder_dropout=0.0,
+                     decoder_dropout=0.0,
+                     ffn_dropout=0.05,
+                     debug=False,
+                     )
 
-def _many(fn):
-    @wraps(fn)
-    def inner(tensors, pattern, **kwargs):
-        return (fn(tensor, pattern, **kwargs) for tensor in tensors)
-    return inner
+torch.cuda.empty_cache()
+model = FourierTransformer2DLite(**config)
+print(get_num_params(model))
 
-rearrange_many = _many(rearrange)
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
 
-# classes
+seq = np.load('seq_1.npy')
+field = np.load('field_1.npy')
 
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-    def forward(self, x, **kwargs):
-        return self.fn(self.norm(x), **kwargs)
+print(seq.shape)
 
-class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout = 0.):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
-    def forward(self, x):
-        return self.net(x)
+epochs = 100
+lr = 1e-3
+h = 1/64
+optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+""" scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, div_factor=1e4, final_div_factor=1e4,
+                       steps_per_epoch=len(train_loader), epochs=epochs)
+"""
 
-class Attention(nn.Module):
-    def __init__(self, pos, dim, heads = 8, dim_head = 64, dropout = 0.):
-        super().__init__()
-        inner_dim = dim_head *  heads
-        project_out = not (heads == 1 and dim_head == dim)
 
-        self.pos = pos
+loss_func = WeightedL2Loss2d(regularizer=True, h=h, gamma=0.1)
 
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-        
-        self.attend = nn.Softmax(dim = -1)
-        self.dropout = nn.Dropout(dropout)
-
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        ) if project_out else nn.Identity()
-
-    def forward(self, x):
-        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = rearrange_many((q, k, v), 'b n (h d) -> b h n d', h = self.heads)
-
-        q = self.pos.rotate_queries_or_keys(q)
-        k = self.pos.rotate_queries_or_keys(k)
-
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
-
-class SpatioTemporalTransformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
-        super().__init__()
-        
-        # https://arxiv.org/abs/2104.09864
-        pos = RotaryEmbedding(dim = dim_head)
-        
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(pos, dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, Attention(pos, dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim))
-            ]))
-             
-    def forward(self, x):
-        b = x.shape[0]
-        
-        # https://arxiv.org/abs/2205.15868
-        for attn_s, attn_t, ff in self.layers:
-            
-            x_s = rearrange(x, 'b t p d -> (b t) p d')
-            x_s = rearrange(attn_s(x_s), '(b t) p d -> b t p d', b=b)
-            
-            x_t = rearrange(x + x_s, 'b t p d -> (b p) t d')    
-            x_t = rearrange(attn_t(x_t), '(b p) t d -> b t p d', b=b)
-            
-            x = ff(x_t + x_s) + x
-            
-        return x
-
-# https://arxiv.org/abs/2010.11929
-class TAViT(nn.Module):
-    def __init__(self,
-                 max_seq_len=15,
-                 channels=1, 
-                 patch_size=32,
-                 dim=256,
-                 heads=6,
-                 depth=3,
-                 dim_head=64,
-                 mlp_dim=128
-                 ):
-        super().__init__()
-        
-        pixel_values_per_patch = channels * patch_size * patch_size
-        
-        self.max_seq_len = max_seq_len
-        
-        self.to_patch_embedding = nn.Sequential(
-            Rearrange('b t c (h p1) (w p2) -> b t (h w) (c p1 p2)', p1 = patch_size, p2 = patch_size),
-            nn.Linear(pixel_values_per_patch, dim),
-        )
-        
-        self.encoder = SpatioTemporalTransformer(dim, depth, heads, dim_head, mlp_dim, 0.01)
-        
-        self.decoder = nn.Sequential(
-            SpatioTemporalTransformer(dim, depth, heads, dim_head, mlp_dim, 0.01),
-            nn.Linear(dim, dim, bias=False)
-        )
-        
-        self.to_pixels = nn.Linear(dim, pixel_values_per_patch)
-            
-    def generate(self, start_tokens, seq_len):
-        _, t, _, h, w = start_tokens.shape
-                
-        out = self.encoder(self.to_patch_embedding(start_tokens))
-        
-        for _ in range(seq_len):
-            x = out[:, -self.max_seq_len:]
-            
-            last = self.decoder(x)[:, -1:]
-            out = torch.cat((out, last), dim = 1)
-        
-        return self.recover(out, h, w)
-
-    def recover(self, x, h, w):
-        p = self.to_pixels(x)
-        p = rearrange(p, 'b t p d -> b t (p d)')
-        p = rearrange(p, 'b t (d h w) -> b t d h w', h=h, w=w)
-        return p
-        
-    def forward(self, x):        
-        h, w = x.shape[3:5]
-        
-        x = self.to_patch_embedding(x)
-        
-        x_e = self.encoder(x)
-        x_p = self.recover(x_e, h, w)
-        
-        x_h = self.decoder(x_e)
-        x_h_p = self.recover(x_h, h, w)
-        
-        return x_e, x_h, x_p, x_h_p
+metric_func = WeightedL2Loss2d(regularizer=False, h=h)
