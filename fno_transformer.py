@@ -42,11 +42,6 @@ print(get_num_params(model))
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 model = model.to(device)
 
-seq = np.load('seq_1.npy')
-field = np.load('field_1.npy')
-
-print(seq.shape)
-
 epochs = 100
 lr = 1e-3
 h = 1/64

@@ -201,9 +201,6 @@ step = 1
 # load data
 ################################################################
 
-seq = torch.tensor(np.load('seq_1.npy')).float()
-field = torch.tensor(np.load('field_1.npy')).float().cuda()
-
 block_size = 20
 data_seqs = []
 stride = 4
