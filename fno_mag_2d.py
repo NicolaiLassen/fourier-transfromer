@@ -1,5 +1,5 @@
 
-from einops import rearrange
+from einops import rearrange, repeat
 import torch
 import numpy as np
 import torch.nn as nn
@@ -15,8 +15,9 @@ from torch.nn.functional import normalize
 torch.manual_seed(0)
 np.random.seed(0)
 from matplotlib.lines import Line2D
-from matplotlib.pyplot import figure
 from torch.utils.data import DataLoader
+
+### Landau-Lifshitz-Gilbert experiment FNO
 
 ################################################################
 # fourier layer
@@ -29,10 +30,10 @@ class SpectralConv2d_fast(nn.Module):
         """
         2D Fourier layer. It does FFT, linear transform, and Inverse FFT.    
         """
-
+        
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.modes1 = modes1 #Number of Fourier modes to multiply, at most floor(N/2) + 1
+        self.modes1 = modes1 # Number of Fourier modes to multiply, at most floor(N/2) + 1
         self.modes2 = modes2
 
         self.scale = (1 / (in_channels * out_channels))
@@ -46,7 +47,7 @@ class SpectralConv2d_fast(nn.Module):
 
     def forward(self, x):
         batchsize = x.shape[0]
-        #Compute Fourier coeffcients up to factor of e^(- something constant)
+        # Compute Fourier coeffcients up to factor of e^(- something constant)
         x_ft = torch.fft.rfft2(x)
 
         # Multiply relevant Fourier modes
@@ -56,114 +57,59 @@ class SpectralConv2d_fast(nn.Module):
         out_ft[:, :, -self.modes1:, :self.modes2] = \
             self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
 
-        #Return to physical space
+        # Return to physical space
         x = torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
         return x
 
 class FNO2d(nn.Module):
-    def __init__(self, modes1, modes2, width):
+    def __init__(self, channels=3, modes_x=8, modes_y=8, dim=64, depth=4, out_scale=2):
         super(FNO2d, self).__init__()
 
-        """
-        The overall network. It contains 4 layers of the Fourier layer.
-        1. Lift the input to the desire channel dimension by self.fc0 .
-        2. 4 layers of the integral operators u' = (W + K)(u).
-            W defined by self.w; K defined by self.conv .
-        3. Project from the channel space to the output space by self.fc1 and self.fc2 .
+        self.project = nn.LazyLinear(dim)
         
-        input: the solution of the previous 10 timesteps + 2 locations (u(t-10, x, y), ..., u(t-1, x, y),  x, y)
-        input shape: (batchsize, x=64, y=64, c=12)
-        output: the solution of the next timestep
-        output shape: (batchsize, x=64, y=64, c=1)
-        """
+        self.fourier_layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.fourier_layers.append(nn.ModuleList([
+                SpectralConv2d_fast(dim, dim, modes_x, modes_y),
+                nn.Conv2d(dim, dim, 1),
+                nn.BatchNorm2d(dim)
+            ]))
 
-        self.modes1 = modes1
-        self.modes2 = modes2
-        self.width = width
-        self.padding = 2
-        self.fc0 = nn.Linear(10 * 3 + 2 + 3, self.width)
-        
-        self.conv0 = SpectralConv2d_fast(self.width, self.width, self.modes1, self.modes2)
-        self.conv1 = SpectralConv2d_fast(self.width, self.width, self.modes1, self.modes2)
-        self.conv2 = SpectralConv2d_fast(self.width, self.width, self.modes1, self.modes2)
-        self.conv3 = SpectralConv2d_fast(self.width, self.width, self.modes1, self.modes2)
-        
-        self.w0 = nn.Conv2d(self.width, self.width, 1)
-        self.w1 = nn.Conv2d(self.width, self.width, 1)
-        self.w2 = nn.Conv2d(self.width, self.width, 1)
-        self.w3 = nn.Conv2d(self.width, self.width, 1)
-        
-        self.bn0 = torch.nn.BatchNorm2d(self.width)
-        self.bn1 = torch.nn.BatchNorm2d(self.width)
-        self.bn2 = torch.nn.BatchNorm2d(self.width)
-        self.bn3 = torch.nn.BatchNorm2d(self.width)
-
-        self.fc1 = nn.Linear(self.width, 128)
-        self.fc2 = nn.Linear(128, 3)
+        self.fc_out = nn.Sequential(
+            nn.Linear(dim, dim * out_scale),
+            nn.GELU(),
+            nn.Linear(dim * out_scale, channels)
+        )
 
     def forward(self, x, f):
-        #  TODO 
-        b, t, c, w, h = x.shape
+        # b t c w h
+        w, h = x.shape[3:]
         
         x = rearrange(x, "b t c w h -> b w h (t c)")
-        # print(x.shape)
               
         grid = self.get_grid(x.shape, x.device)
         
-        # print(grid.shape)
-        # print(x.shape)
+        f = repeat(f, "b d -> b w h d", w=w, h=h)
+        f = normalize(f, dim=0)
         
-        f = f.repeat(b, w, h, 1)
-        f = normalize(f, dim=1)
+        # Field and bound grid
+        x = torch.cat((x, f, grid), dim=-1)
+        x = normalize(x, dim=0)
+    
+        x = self.project(x)
         
-        x = torch.cat((x, f), dim=-1)
+        x = rearrange(x, "b w h c -> b c w h")
         
-        x = torch.cat((x, grid), dim=-1)
-        # print(x.shape)
+        for fo, w, bn in self.layers:
+            x1 = fo(x)
+            x2 = w(x)
+            x = bn(x1 + x2)
+            x = F.gelu(x)
         
-        x = self.fc0(x)
-        # print(x.shape)
-        
-        x = x.permute(0, 3, 1, 2)
-        
-        # print(x.shape)
-        
-        # x = F.pad(x, [0,self.padding, 0,self.padding]) # pad the domain if input is non-periodic
-
-        x1 = self.conv0(x)
-        x2 = self.w0(x)
-        x = x1 + x2
-        x = F.gelu(x)
-
-        # print(x.shape)
-
-        x1 = self.conv1(x)
-        x2 = self.w1(x)
-        x = x1 + x2
-        x = F.gelu(x)
-
-        # print(x.shape)
-
-        x1 = self.conv2(x)
-        x2 = self.w2(x)
-        x = x1 + x2
-        x = F.gelu(x)
-
-        # print(x.shape)
-
-        x1 = self.conv3(x)
-        x2 = self.w3(x)
-        x = x1 + x2
-
-        # x = x[..., :-self.padding, :-self.padding] # pad the domain if input is non-periodic
-        x = x.permute(0, 2, 3, 1)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.fc2(x)
+        x = rearrange(x, "b c w h -> b w h c")
+        x = self.fc_out(x)
         
         x = rearrange(x, "b w h c -> b 1 c w h")
-        # print(x.shape)
-        # exit(0)
         return x
 
     def get_grid(self, shape, device):
@@ -173,7 +119,6 @@ class FNO2d(nn.Module):
         gridy = torch.tensor(np.linspace(0, 1, size_y), dtype=torch.float)
         gridy = gridy.reshape(1, 1, size_y, 1).repeat([batchsize, size_x, 1, 1])
         return torch.cat((gridx, gridy), dim=-1).to(device)
-
 
 ################################################################
 # configs
@@ -208,7 +153,7 @@ stride = 4
 for i in range(0,  seq.size(0) - block_size + 1, stride):
     data_seqs.append(seq[i: i + block_size].unsqueeze(0))
 
-data = torch.cat(data_seqs , dim=0).float().cuda()
+data = torch.cat(data_seqs , dim=0).float()
 
 trainset = DataLoader(dataset=data, batch_size=batch_size, shuffle=True)
 
@@ -217,11 +162,10 @@ trainset = DataLoader(dataset=data, batch_size=batch_size, shuffle=True)
 ################################################################
 
 model = FNO2d(modes, modes, width).cuda()
-# model = torch.load('model/ns_fourier_V100_N1000_ep100_m8_w20')
+# model = torch.load()
 
 optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
-
 
 ################################################################
 # loss function
@@ -273,10 +217,10 @@ class LpLoss(object):
         return self.rel(x, y)
  
 ################################################################
-# plot mean data
+# plot mag mean data
 ################################################################
     
-def plot_prediction(y_pred, y_target) -> None:
+def plot_prediction(y_pred, y_target, epoch) -> None:
     y_pred = y_pred.detach().cpu().numpy()
     y_target = y_target.detach().cpu().numpy()
     
@@ -308,14 +252,17 @@ def plot_prediction(y_pred, y_target) -> None:
     plt.grid()
     plt.title('Fourier Neural Operator')
     plt.show()
-    plt.close()
+    plt.savefig("./images/fno_{}".format(epoch))
     
 ################################################################
 # train
 ################################################################
     
 myloss = LpLoss(size_average=False)
-for ep in range(epochs):
+
+from tqdm import tqdm
+pbar = tqdm(range(epochs))
+for ep in pbar:
     model.train()
     t1 = default_timer()
     train_l2_step = 0
@@ -330,7 +277,7 @@ for ep in range(epochs):
         for t in range(0, T, step):
             y = yy[:, t:t + step]
             
-            im = model(xx, field.unsqueeze(0))
+            im = model(xx.cuda(), field.cuda())
                         
             loss += myloss(im.reshape(batch_size, -1), y.reshape(batch_size, -1))
 
@@ -349,7 +296,7 @@ for ep in range(epochs):
         loss.backward()
         optimizer.step()
         
-    print(loss)
+    pbar.set_postfix({'loss': loss})
     scheduler.step()
     model.eval()
     
@@ -361,5 +308,5 @@ for ep in range(epochs):
                 im = model(whole_seq[:, t:], field.unsqueeze(0))
                 whole_seq = torch.cat((whole_seq, im), dim=1)
             
-            plot_prediction(whole_seq[0], seq)
-            
+            plot_prediction(whole_seq[0], seq, ep)
+            torch.save(model.state_dict(), "./ckpt/fno_1.pth_{}".format(ep))
