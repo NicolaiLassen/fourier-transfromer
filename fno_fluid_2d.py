@@ -1,4 +1,3 @@
-
 from einops import rearrange, repeat
 import torch
 import numpy as np
@@ -17,14 +16,6 @@ np.random.seed(0)
 from matplotlib.lines import Line2D
 from torch.utils.data import DataLoader
 import h5py
-
-### Landau-Lifshitz-Gilbert experiment FNO
-
-# problem 4
-f = h5py.File('./problem4.h5')
-sample_idx = 0
-prob_sample = np.array(f[str(sample_idx)]['sequence'])
-prob_field = np.array( f[str(sample_idx)]['field'])
 
 ################################################################
 # fourier layer
@@ -69,7 +60,7 @@ class SpectralConv2d(nn.Module):
         return x
 
 class FNO2d(nn.Module):
-    def __init__(self, channels=3, modes_x=8, modes_y=8, dim=32, depth=16, mlp=128):
+    def __init__(self, channels=1, modes_x=8, modes_y=8, dim=32, depth=8, out_scale=2):
         super(FNO2d, self).__init__()
 
         self.project = nn.LazyLinear(dim)
@@ -83,25 +74,22 @@ class FNO2d(nn.Module):
             ]))
 
         self.fc_out = nn.Sequential(
-            nn.Linear(dim, mlp),
+            nn.Linear(dim, dim * out_scale),
             nn.GELU(),
-            nn.Linear(mlp, channels)
+            nn.Linear(dim * out_scale, channels)
         )
 
-    def forward(self, x, f):
+    def forward(self, x):
         # b t c w h
         w, h = x.shape[3:]
         
+        x = normalize(x, dim=0)
         x = rearrange(x, "b t c w h -> b w h (t c)")
-        x = normalize(x, dim=-1)
-
+              
         grid = self.get_grid(x.shape, x.device)
         
-        f = repeat(f, "b d -> b w h d", w=w, h=h)
-        f = normalize(f, dim=-1)
-        
         # Field and bound grid
-        x = torch.cat((x, f, grid), dim=-1)
+        x = torch.cat((x, grid), dim=-1)
     
         x = self.project(x)
         
@@ -114,7 +102,6 @@ class FNO2d(nn.Module):
             x = F.gelu(x)
         
         x = rearrange(x, "b c w h -> b w h c")
-
         x = self.fc_out(x)
         
         x = rearrange(x, "b w h c -> b 1 c w h")
@@ -132,13 +119,17 @@ class FNO2d(nn.Module):
 # configs
 ################################################################
 
-batch_size = 512
+modes = 8
+width = 64
+
+batch_size = 8
 
 epochs = 1000
 learning_rate = 0.001
-scheduler_step = 10
+scheduler_step = 100
 scheduler_gamma = 0.5
 
+sub = 1 
 S = 64
 T_in = 10
 T = 10
@@ -152,27 +143,32 @@ block_size = 20
 data_seqs = []
 stride = 20
 
-from util.data_loader import read_h5_dataset
-
 if __name__ == '__main__':
     plt.figure(figsize=(16,9),dpi=140)
 
-    train_set = read_h5_dataset(
-        "C:\\Users\\s174270\\Documents\\datasets\\64x16 field\\field_s_state_train_circ_paper.h5",
-        block_size,
-        batch_size,
-        stride,
-        -1
-    )
+    seq = []
+    block_size = 20
+    stride = 20
+    n_data = -1
+    
+    with h5py.File('./data/fluid_dataset.h5', 'r') as f: 
+        n_seq = 0
+        for key in f.keys():
+            data_series = torch.Tensor(np.array(f[key]))
+           
+            for i in range(0,  data_series.size(0) - block_size + 1, stride):
+                seq.append(data_series[i: i + block_size].unsqueeze(0))
 
-    dl = DataLoader(
-                train_set,
-                batch_size=batch_size,
-                shuffle=True,
-                persistent_workers=True,
-                num_workers=1,
-                pin_memory=True,
-            )
+            n_seq = n_seq + 1
+            if(n_data > 0 and n_seq >= n_data):  # If we have enough time-series samples break loop
+                break
+
+    data = torch.cat(seq , dim=0).float().unsqueeze(2)
+    
+    train_len = int(len(data) * 0.9)
+    train_dataset, test_dataset = torch.utils.data.random_split(data, [train_len, len(data) - train_len])
+
+    trainset = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
 
     ################################################################
     # training and evaluation
@@ -232,44 +228,6 @@ if __name__ == '__main__':
 
         def __call__(self, x, y):
             return self.rel(x, y)
-    
-    ################################################################
-    # plot mag mean data
-    ################################################################
-        
-    def plot_prediction(y_pred, y_target, epoch) -> None:
-        y_pred = y_pred.detach().cpu().numpy()
-        y_target = y_target.detach().cpu().numpy()
-        
-        timeline = np.arange(y_pred.shape[0]) * 4e-12 * 1e9
-        
-        plt.plot(timeline, np.mean(y_target[:,0].reshape(y_target.shape[0],-1), axis=1), 'r')
-        plt.plot(timeline, np.mean(y_target[:,1].reshape(y_target.shape[0],-1), axis=1), 'g')
-        plt.plot(timeline, np.mean(y_target[:,2].reshape(y_target.shape[0],-1), axis=1), 'b')
-
-        plt.plot(timeline, np.mean(y_pred[:,0].reshape(y_pred.shape[0],-1), axis=1), 'rx')
-        plt.plot(timeline, np.mean(y_pred[:,1].reshape(y_pred.shape[0],-1), axis=1), 'gx')
-        plt.plot(timeline, np.mean(y_pred[:,2].reshape(y_pred.shape[0],-1), axis=1), 'bx')
-        
-        legend_elements = [
-            Line2D([0], [0], color='red', lw=4, label='Mx MagTense'),
-            Line2D([0], [0], color='green', lw=4, label='My MagTense'),
-            Line2D([0], [0], color='blue', lw=4, label='Mz MagTense'),
-            Line2D([0], [0], marker='x', color='red', label='Mx Model'),
-            Line2D([0], [0], marker='x', color='green', label='My Model'),
-            Line2D([0], [0], marker='x', color='blue', label='Mz Model'),
-        ]
-        
-        plt.legend(handles=legend_elements)
-        plt.setp(plt.gca().get_legend().get_texts(), fontsize='16')
-        plt.ylabel('$M_i [-]$', fontsize=32)
-        plt.xlabel('$Time [ns]$', fontsize=32)
-        plt.xticks(fontsize=24)
-        plt.yticks(fontsize=24)
-        plt.grid()
-        plt.title('Fourier Neural Operator', fontsize=48)
-        plt.savefig("./fno/images/fno_{}.png".format(epoch))
-        plt.clf()
         
     ################################################################
     # train
@@ -277,6 +235,7 @@ if __name__ == '__main__':
         
     myloss = LpLoss(size_average=False)
 
+    from matplotlib.animation import FuncAnimation, writers
     from tqdm import tqdm
     pbar = tqdm(range(epochs))
     loss_epoch = 9999
@@ -286,20 +245,19 @@ if __name__ == '__main__':
         train_l2_step = 0
         train_l2_full = 0
 
-        for step_idx, x in enumerate(dl):
+        for step_idx, x in enumerate(trainset):
             
-            s = x["states"][:, :T_in].cuda()
-            f = x["fields"].cuda()
-
+            s = x[:, :T_in].cuda()
+            
             loss = 0
-            yy = x["states"][:, T_in:T+T_in].cuda()
+            yy = x[:, T_in:T+T_in].cuda()
 
             for t in range(0, T, step):
                 y = yy[:, t:t + step]
                 
-                im = model(s, f)
+                im = model(s)
 
-                loss += myloss(im.reshape(batch_size, -1), y.reshape(batch_size, -1))
+                loss += myloss(torch.flatten(im, start_dim=1), torch.flatten(y, start_dim=1))
 
                 if t == 0:
                     pred = im
@@ -309,28 +267,39 @@ if __name__ == '__main__':
                 s = torch.cat((s[:, step:], im), dim=1)
 
             train_l2_step += loss.item()
-            l2_full = myloss(pred.reshape(batch_size, -1), yy.reshape(batch_size, -1))
+            l2_full =myloss(torch.flatten(yy, start_dim=1), torch.flatten(pred, start_dim=1))
             train_l2_full += l2_full.item()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            pbar.set_postfix({'step': '{}/{}'.format(step_idx + 1,len(dl)), 'loss': loss_epoch})
+            pbar.set_postfix({'step': '{}/{}'.format(step_idx + 1,len(trainset)), 'loss': loss_epoch})
 
-        loss_epoch = train_l2_step / len(dl)
+        loss_epoch = train_l2_step / len(trainset)
         
         scheduler.step()
         model.eval()
         
         with torch.no_grad():
             if ep % 10 == 10 - 1:
-                y = torch.tensor(prob_sample).cuda().float()
-                whole_seq = torch.tensor(prob_sample[:T_in]).unsqueeze(0).cuda().float()
-                f = torch.tensor(prob_field)[:2].unsqueeze(0).cuda().float()
                 
-                for t in range(0, 400 - T_in, step):
-                    im = model(whole_seq[:, t:], f.cuda())
+                y = next(iter(trainset)).cuda()
+                whole_seq = y[:1, :T_in]                
+                
+                for t in range(0, 100 - T_in, step):
+                    im = model(whole_seq[:, t:])
                     whole_seq = torch.cat((whole_seq, im), dim=1)
                 
-                plot_prediction(whole_seq[0], y, ep + 1)
-                torch.save(model.state_dict(), "./fno/ckpt/fno_{}.pth".format(ep + 1))
+                fig = plt.figure()
+                im = plt.imshow(whole_seq[0,0,0].detach().cpu().numpy(), vmin=0, vmax=1, cmap=plt.cm.gray,
+                                interpolation='bicubic', animated=True, origin='lower')
+                
+                def animate(t):
+                    im.set_data(whole_seq[0,t,0].detach().cpu().numpy(),)
+                    return im,
+                
+                anim = FuncAnimation(fig, animate, frames=100, interval=60, blit=True)    
+                
+                anim.save('fluid_model.gif', fps=64, dpi=72, writer='imagemagick')
+                
+                # torch.save(model.state_dict(), "./fno/ckpt/fno_{}.pth".format(ep + 1))

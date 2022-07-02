@@ -1,2 +1,4 @@
-./data/*
+data/*
 **/__pycache__/
+models/*
+data/fluid_dataset.h5
